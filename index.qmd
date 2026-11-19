@@ -1,0 +1,394 @@
+---
+title: "Count Regression"
+format: 
+  html:
+      embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r, setup}
+options(scipen = 999)
+
+library(dplyr)
+library(glmmTMB)
+library(DHARMa)
+library(ggeffects)
+library(emmeans)
+library(tidyverse)
+library(broom.mixed)
+library(gt)
+library(AER)
+
+data("NMES1988")
+data <- NMES1988
+```
+
+```{r, load_data_variables}
+
+data <- data |>
+  select(visits, chronic, health, gender, school, insurance) |>
+  mutate(
+    health = fct_relevel(health, "average"),
+    gender = fct_relevel(gender, "male"),
+    insurance = fct_relevel(insurance, "no")
+  )
+```
+## Explore the Data
+
+```{r, describe}
+
+visits_summary <- data |>
+  summarise(
+    n = n(),
+    mean = mean(visits), 
+    var = var(visits), 
+    p_zero = mean(visits == 0),
+    max = max(visits)
+  )
+
+visits_summary |>
+  gt() |>
+  fmt_number(column = c(mean, var, p_zero), decimals = 2)
+```
+```{r, barchart}
+
+visits_plot <- ggplot(data, aes(x = visits)) +
+  geom_bar() +
+  labs(x = "Physician office visits", y = "Number of people")
+
+visits_plot
+```
+
+The outcome is a count, since its the number of physician office visits. This is because it can only be a whole number, and not a negative. Across `r visits_summary$n` older adults, the mean number of visits was `r round(visits_summary$mean,2)`, but the variance was `r round(visits_summary$var / visits_summary$mean, 1)` times larger than the mean. A poisson model assumes the two are equal, so this suggests overdispersion. `r round(visits_summary$p_zero * 100, 1)`% of people had no visits at all, which is the tallest bar in the plot. The distribution is strongly right-skewed: most people had fewer than about 20 visits, but a few had unusual high counts, up to a maximum of `r visits_summary$max`
+
+### Why not a linear model?
+
+```{r, linear_m}
+
+m_gauss <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  data = data,
+  family = gaussian(link = "identity")
+)
+set.seed(2004)
+res_gauss <- simulateResiduals(m_gauss, n = 500, plot = FALSE)
+plot(res_gauss)
+```
+The DHARMa residual plot shows that a linear model fits these data poorly, If the model were appropriate, the points in the QQ plot would fall along the diagnal line, but instead they form an S-shaped curve that bends away from it, and the KS test flags this deviation as signficant. In the residuals versus predicted panel, the red line should be flat at 0.25, 0.50, and 0.75, but they slope and fan apart, showinf that the spread of the residuals changes as predicted values increase. Many points are also marked as outliers along th top. These problems reflect deeper issues with using a linear model for counts. A linear model can predict negative numbers of vsists, which is impossible. It assumes that the variance is the same for everyone, which for counts the varience tends to grow as the mean grows. It also treats predictors as adding a fixed number of visits, when for counts it is more natural for predicotrs to multipe to expected number of visits. A count model such as Poisson or negative binomial model, which uses a log link, avoids all of these problems. 
+
+## Poisson models 
+
+```{r, poisson}
+
+m0 <- glmmTMB(visits ~ 1, data = data, family = poisson(link = "log"))
+m1 <- glmmTMB(visits ~ chronic, data = data, family = poisson(link = "log"))
+m2 <- glmmTMB(visits ~ chronic + health + gender + school + insurance, data = data, family = poisson(link = "log"))
+lrt_pois <- anova(m0, m1, m2)
+```
+
+All of the models were then compared; specifically, all three of the nested Poisson models were compared using the likelihood ratio test. M1 added the number of chronic conditions, which made the fit significantly better than the intercept-only model (M0) χ²(`r lrt_pois$"Chi Df"[2]`) = `r round(lrt_pois$Chisq[2], 2)`, p `r ifelse(lrt_pois$"Pr(>Chisq)"[2] < .001, "< .001", paste("=", round(lrt_pois$"Pr(>Chisq)"[2], 3)))`,therefore, the chronic conditions are related tot he amount of visits. Now, adding self-perceived health, gender, years of school, and private insurance (M2) made the fit even better  χ²(`r lrt_pois$"Chi Df"[3]`) = `r round(lrt_pois$Chisq[3], 2)`, p `r ifelse(lrt_pois$"Pr(>Chisq)"[3] < .001, "< .001", paste("=", round(lrt_pois$"Pr(>Chisq)"[3], 3)))`. This means that the variables help to explain visits beyond the chronic conditions on their own. Also, when looking at IAC, M2 had the lowest value (`r round(lrt_pois$AIC[3],1)`) and BIC (`r round(lrt_pois$BIC[3], 1)`). Because of all of these reasons, M2 will be the model moving forward. 
+
+```{r, prepare tests}
+
+tests <- as.data.frame(lrt_pois) |>
+  select(Chisq, `Chi Df`, `Pr(>Chisq)`) |>
+  rename(
+    Nested.df = `Chi Df`,
+    Nested.Chisq.stat = Chisq,
+    Nested.p.value = `Pr(>Chisq)`)
+```
+
+```{r, extract model metrics}
+
+glance0 <- broom.mixed::glance(m0)
+glance1 <- broom.mixed::glance(m1)
+glance2 <- broom.mixed::glance(m2)
+```
+
+```{r, combine model metrics}
+
+mods <- c(
+  "M0: Null",
+  "M1: Chronic",
+  "M2: Full")
+
+glances <- rbind(
+  glance0,
+  glance1,
+  glance2)
+```
+
+```{r, combine comparisons}
+
+comparison_table <- cbind(
+  Model = mods,
+  glances,
+  tests)
+```
+
+```{r, model comparison table}
+
+comparison_table |>
+  select(
+    Model,
+    AIC,
+    BIC,
+    logLik,
+    deviance,
+    df.residual,
+    Nested.df,
+    Nested.Chisq.stat,
+    Nested.p.value
+  ) |>
+  gt() |>
+  cols_label(
+    Model = "Model",
+    AIC = "AIC",
+    BIC = "BIC",
+    logLik = "Log-likelihood",
+    deviance = "Deviance",
+    df.residual = "Residual.df",
+    Nested.df = "Nested df",
+    Nested.Chisq.stat = "Nested χ²",
+    Nested.p.value = "Nested p"
+  ) |>
+  fmt_number(
+    columns = c(
+      AIC,
+      BIC,
+      logLik,
+      deviance,
+      Nested.Chisq.stat
+    ),
+    decimals = 3
+  ) |>
+  fmt(
+    columns = Nested.p.value,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  ) |>
+  sub_missing(
+    columns = c(Nested.df, Nested.Chisq.stat),
+    missing_text = "—"
+  )
+```
+```{r, select model}
+
+selected_row <- comparison_table |>
+  filter(Nested.p.value < .05) |>
+  slice_tail(n = 1)
+
+#creating an object with our selected model's name for dynamic reporting
+selected_name <- selected_row$Model
+
+#case matching for dynamic reporting
+selected_model <- switch(
+  selected_name,
+  "M0: Null" = m0,
+  "M1: Chronic" = m1,
+  "M2: Full" = m2)
+```
+### Evaluate the Poisson model
+
+```{r, eval_poisson}
+set.seed(2004)
+res_pois <- simulateResiduals(m2, n = 500, plot = FALSE)
+plot(res_pois)
+
+disp_pois <- testDispersion(res_pois, plot = FALSE)
+zi_pois <- testZeroInflation(res_pois, plot = FALSE)
+```
+Similarly to previous plots, the DHARMa plot shows that the Poisson model fits poorly. The QQ plot has an S-Shape instead of the diagonal it is meant to make. The residuals lines aren't flat, and there are points which are outliers on both the top and the bottom. The dispersion ratio was `r round(disp_pois$statistic, 2)` (p < .001), and the observed/expected ratio of zeros was `r round (zi_pois$statistic, 2)` (p < .001): the model expected only about 45 people with no vsits, but 683 had none. 
+
+Over-dispersion matters because the Poisson model assumes the variance is equal to the mean. When the real variance is larger, the model thinks its estimated are more precis than they are, so the standard errors are too small, the confidence intervals are too narrow, and the p-values are too small, which makes effects look more significant than they really are. However, we should not move to a zero-inflated model based on this test alone. Over-dispersion itself can cause extra zeros. The negative binomial model should be fit first, since it allows for extra variance and may even account for the zeros. 
+
+```{r, neg_binom}
+
+m_nb <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  data = data,
+  family = nbinom2(link = "log")
+)
+lrt_nb <- anova(m2, m_nb)
+lrt_nb
+chi_nb <- round(lrt_nb$Chisq[2], 2)
+df_nb <- lrt_nb$"Chi Df"[2]
+
+set.seed(2004)
+res_nb <- simulateResiduals(m_nb, n=500, plot = FALSE)
+plot(res_nb)
+
+disp_nb <- testDispersion(res_nb)
+zi_nb <- testZeroInflation(res_nb)
+disp_nb
+zi_nb
+```
+
+When comparing the Negative Binomial model (NB) to the Poisson model, it is apparent that the NB2 model fits better than Poisson χ²(`r df_nb`) = `r chi_nb`, p < .001. Because there were the same predictors, only the extra dispersion parameter, the test had only 1 degree of freedom between NB2 and Poisson. This allows for the variance to be larger than the mean. The result shows that the Poisson model's conclusion could not be trusted since it ignores overdispersion; its standard error was too small, so its confidence intervals were too narrow, and its p-value made the effect look more certain than it really was. Meanwhile, the NB2 was better at giving accurate standard errors. 
+
+```{r, zero_inf}
+m_zinb <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  ziformula = ~ chronic + health + gender + school + insurance,
+ family = nbinom2, data = data
+)
+```
+
+```{r, visualize_pred_count}
+plot(predict_response(m_nb, terms = "chronic"))
+```
+This plot compares physician visits across different levels of chronic conditions, while also accounting for the other predictors. As seen in the figure, the curve goes upward, rather than straight, because the NB2 model uses a log link. 
+The reason this happens is that while the chronic condition effect is a straight line, converting back to visits, the extra chronic conditions multiply the expected number of visits rather than adding a fixed number
+
+```{r, decision}
+
+m_hnb <- glmmTMB(visits ~ chronic + health + gender + school + insurance,
+                ziformula = ~ chronic + health + gender + school + insurance,
+                family = truncated_nbinom2(), data = data)
+
+lrt_zero <-anova(m_nb, m_zinb)
+lrt_zero
+
+aic_tab <- AIC(m_nb, m_zinb, m_hnb)
+bic_tab <- BIC(m_nb, m_zinb, m_hnb)
+aic_tab
+bic_tab
+
+
+set.seed(2004)
+sim<- simulateResiduals(m_hnb, n = 500)
+plot(sim)
+disp_chk <- testDispersion(sim)
+zi_chk <- testZeroInflation(sim)
+```
+We fit the zero-inflated negative binomial (ZINB) model and hurdle negative binomial model because there were still under-predicted zeros. The ZINB fit significantly better than the previous model (χ²(`r lrt_zero$"Chi Df"[2]`) = `r round(lrt_zero$Chisq[2], 2)`, p < .001), which shows that modelling the zeros separately did improve the fit. All of the three models were compared using the AIC and BIC. The hurdle model had the lowest AIC (`r round(aic_tab["m_hnb", "AIC"], 1)`) and BIC (`r round(bic_tab["m_hnb", "BIC"], 1)`), in comparison to the ZINB model (AIC = `r round(aic_tab["m_zinb", "AIC"], 1)`, BIC = `r round(bic_tab["m_zinb", "BIC"], 1)`) and the NB2 (AIC = `r round(aic_tab["m_nb", "AIC"], 1)`, BIC = `r round(bic_tab["m_nb", "BIC"], 1)`). 
+Once checking the DHARMa check of the hurdle model, the zero-inflation test was not significant (ratio = `r round(zi_chk$statistic, 2)`, p = `r round(zi_chk$p.value, 3)`),. This means that the model produces the number of people with no visits. Alternatively the dispersion test was still significant (ratio = `r round(disp_chk$statistic, 2)`, p = `r round(disp_chk$p.value, 3)`), but the ratio is close to 1. In this case, the QQ plot has almost an exact diagnol match up. Therefore, the hurdle model is the one moving forward, regardless of the leftover dispersion and outliers as limitations. 
+
+```{r,int_fit }
+
+m_int <- glmmTMB(
+  visits ~ chronic * gender + insurance + health + school,
+  ziformula = ~ chronic + health + gender + school + insurance,
+  family = truncated_nbinom2(), data = data
+)
+
+summary(m_int)
+
+lrt_int <- anova(m_hnb, m_int)
+chi_int <- round(lrt_int$Chisq[2], 2)
+df_int <- lrt_int$"Chi Df"[2]
+p_int <- round(lrt_int$"Pr(>Chisq)"[2],3)
+```
+Taking the hurdle model that does not have the chronic x gender interaction and then comparing it to one that does have it gave χ²(`r df_int`) = `r chi_int`, p = `r p_int`. This means that the interaction doesn't significantly improve the fit of the model. Now, to go beyond the omnibus test, we still probed the interaction. We did this since the omnibus test just tells us if the two slopes are different from one another. This showed that chronic conditions strongly relate to visits for men and for women separately, and that there are gender differences at low, average, and high numbers of chronic conditions.
+
+
+```{r, m_int plot}
+
+pred_int <- predict_response(m_int, terms = c("chronic", "gender"))
+
+plot(pred_int) +
+  scale_colour_manual(values = c(male = "green4", female = "darkorange")) +
+  scale_fill_manual(values = c(male = "green4", female = "darkorange")) +
+  labs(
+    title  = "Predicted physician visits by chronic conditions and gender",
+    x      = "Number of chronic conditions", y = "Predicted visits",
+    colour = NULL, fill = NULL
+  )
+```
+We predict that gender will moderate the association between chronic conditions and physician visits. The reason is that women tend to visit the doctor more often than men, so once we account for chronic conditions, the increase in visits might be coming more from women than men. Additionally, because of this, the greater the increase in chronic conditions, the greater the gap between women and men. 
+```{r int-slopes}
+
+slopes <- emtrends(
+  m_int, 
+  specs = ~ gender, 
+  var = "chronic")
+
+slope_diff <- as.data.frame(pairs(slopes))
+
+pairs(slopes)
+
+
+slopes_sum <- summary(slopes, infer = TRUE)
+slopes_sum
+```
+
+The comparison that comes from pairs gives an estimate of `r round(slope_diff$estimate,3)` (SE=`r round(slope_diff$SE, 3)`, p = `r round(slope_diff$p.value, 3)`). When comparing it to the model summary, it matches the chronic: genderfemale interaction coefficients. The size, standard error, and p-value are the same, but with opposite signs. The sign being flipped is because pairs() subtracts female from male, while the interaction coefficient shows how the female slope differs from the male reference group. Because gender has only two levels, there is only one pair of slopes, so testing whether the two slopes differ is the same as testing whether the interaction coefficient is zero
+
+```{r, interac simple-effects}
+
+chronic_mean <- mean(data$chronic, na.rm = TRUE)
+chronic_sd <- sd(data$chronic, na.rm = TRUE)
+chronic_values <- chronic_mean + c(-1, 0, 1) * chronic_sd
+
+
+gender_emmeans <- emmeans(
+  m_int,
+  specs = ~ gender | chronic,
+  at = list(chronic = chronic_values)
+)
+
+summary(gender_emmeans, type = "response")
+
+
+pairs(gender_emmeans)
+```
+The count that was predicted from emmans may have been different from teh ggeffects plot because the two methods handle the other predictors differently. On one hand, ggeffects takes health and insurance at their reference levels, while emmean averages their levels. The contrasts do not change because those other predictors add the same amount to men and women on the log scale, so they cancel out when we take the difference.
+
+```{r, m_int table}
+
+contrast_df <- summary(pairs(gender_emmeans)) |>
+  as.data.frame() |>
+  mutate(
+    chronic_level = c("-1 SD", "Mean", "+1 SD")[match(round(chronic, 6), round(chronic_values, 6))]
+  ) |>
+  select(chronic_level, contrast, estimate, SE, z.ratio, p.value)
+
+contrast_df |>
+  gt() |>
+  cols_label(
+    chronic_level = "Chronic condition", contrast = "Contrast",
+    estimate = "Log Contrast", SE = "SE", z.ratio = "z", p.value = "p"
+  ) |>
+  fmt_number(columns = c(estimate, SE, z.ratio), decimals = 3) |>
+  fmt(columns = p.value,
+      fns = \(x) scales::pvalue(x, accuracy = 0.001, add_p = FALSE)) |>
+  tab_header(
+    title    = "Simple Effects of Gender Across Chronic Conditions",
+    subtitle = "Hurdle negative binomial regression (log link)"
+  ) |>
+  tab_source_note(
+    "Log contrasts = male − female. z-tests and p-values are computed on the log scale."
+  )
+```
+When examining the relationship between chronic condition, physician visits and how they differ by gender, it is shown that there is little evidence to support this. The omnibus likelihood ratio test, which compared the model of chronic x gender interaction to the model without it was not significant  (χ²(`r lrt_int$"Chi Df"[2]`) = `r round(lrt_int$Chisq[2], 2)`, p = `r round(lrt_int$"Pr(>Chisq)"[2], 3)`). This means that the interaction did not give a meaningful enough improvement to the fit. In the probing results, the difference between gender showed that women had more visits than men at all the different levels of chronic conditions, and the log difference grew from `r round(contrast_df$estimate[1], 3)` at 1 SD below the mean to `r round(contrast_df$estimate[3], 3)` at 1 SD above the mean.The gender difference was not significant at low (p = `r round(contrast_df$p.value[1], 3)`), average (p = `r round(contrast_df$p.value[2], 3)`) or high (p = `r round(contrast_df$p.value[3], 3)`) numbers of chronic conditions. There is therefore low confidence in this interaction and conclude that chronic conditions are associated with more visits in a similar way for men and women. 
+
+```{r, fx_sl}
+fx <- tidy(m_hnb, effects = "fixed", component = "cond", conf.int = TRUE)
+sl <- as.data.frame(summary(slopes, infer = TRUE))
+```
+## Write up and discussion 
+The mean for physician office visits was `r round(visits_summary$mean, 2)` and a variance of `r round(visits_summary$var, 2)`, and `r round(visits_summary$p_zero*100, 1)`% of participants had no visits. DHARMa tests on the Poisson model showed overdispersion (dispersion ratio = `r round(disp_pois$statistic, 2)`, p < .001) and too many zeros (zero-inflation ratio = `r round(zi_pois$statistic, 2)`, p < .001). The NB2 model fit significantly better than the Poisson, χ²(`r df_nb`) = `r chi_nb`, p < .001. The NB2 fixed the overdispersion (dispersion ratio = `r round(disp_nb$statistic, 2)`, p = `r round(disp_nb$p.value, 3)`), but still underpredicted zeros (zero-inflation ratio = `r round(zi_nb$statistic, 2)`, p = `r round(zi_nb$p.value, 3)`), so a separate model for the zeros was needed. The hurdle negative binomial model had the lowest AIC and BIC and was selected as the final model.
+
+In the count part of the hurdle model, holding all other predictors constant, each additional chronic condition was associated with more visits (b = `r round(fx$estimate[2], 2)`, 95% CI [`r round(fx$conf.low[2], 2)`, `r round(fx$conf.high[2], 2)`], p < .001). Compared with people in average health, people in poor health had fewer visits (b = `r round(fx$estimate[3], 2)`, 95% CI [`r round(fx$conf.low[3], 2)`, `r round(fx$conf.high[3], 2)`], p < .001), and people in excellent health had fewer visits (b = `r round(fx$estimate[4], 2)`, 95% CI [`r round(fx$conf.low[4], 2)`, `r round(fx$conf.high[4], 2)`], p < .001). Gender was not significantly associated with visits (b = `r round(fx$estimate[5], 2)`, 95% CI [`r round(fx$conf.low[5], 2)`, `r round(fx$conf.high[5], 2)`], p = `r round(fx$p.value[5], 3)`). Each extra year of school was associated with more visits (b = `r round(fx$estimate[6], 2)`, 95% CI [`r round(fx$conf.low[6], 2)`, `r round(fx$conf.high[6], 2)`], p < .001), and people with private insurance had more visits than those without (b = `r round(fx$estimate[7], 2)`, 95% CI [`r round(fx$conf.low[7], 2)`, `r round(fx$conf.high[7], 2)`], p = `r round(fx$p.value[7], 3)`).
+
+Adding the chronic × gender interaction did not significantly improve the fit of the model, χ²(`r df_int`) = `r chi_int`, p = `r p_int`. Chronic conditions were positively associated with visits for both men (b = `r round(sl$chronic.trend[1], 2)`, 95% CI [`r round(sl$asymp.LCL[1], 2)`, `r round(sl$asymp.UCL[1], 2)`], p < .001) and women (b = `r round(sl$chronic.trend[2], 2)`, 95% CI [`r round(sl$asymp.LCL[2], 2)`, `r round(sl$asymp.UCL[2], 2)`], p < .001). The gender difference was not significant at −1 SD of chronic conditions (log contrast = `r round(contrast_df$estimate[1], 3)`, p = `r round(contrast_df$p.value[1], 3)`), and it was also not significant at the mean (log contrast = `r round(contrast_df$estimate[2], 3)`, p = `r round(contrast_df$p.value[2], 3)`) and at +1 SD (log contrast = `r round(contrast_df$estimate[3], 3)`, p = `r round(contrast_df$p.value[3], 3)`). Overall, women had slightly more visits than men at every level of chronic conditions, but the difference was not significant at any level 
+
+Therefore, the overall results suggest that health need is the most important driver for why older adults visit a physician. This is seen through the relationship between additional chronic conditions and more visits. Specifically, self-perceived health had the largest effects, with people in excellent health visiting much less than those with average health. Additionally, access to care seems to matter, as people with private insurance and more years of school were associated with more visits. Interestingly, gender was not related to how many visits people had, but rather the likelihood of passing the threshold of making a visit in the first place. It was seen that women were more likely to have at least one visit, while men were more likely to have no visits at all. Research shows that men are more likely to delay and avoid seeking medical health care (including for mental health and physical disabilities) , while women visit the doctors more compared to men even when controlling for health issues (Galdas et al., 2005; Bertakis et al., 2000). This may be primarily because of social standards for men to seek help, or denial about health concerns. 
+
+The limitations for this analysis include the fact that it was cross-sectional, meaning the findings weren't causal but an association. The data is also an older set (1987-1988), so it may not be a good reflection of today's health care. Additionally, there are plenty of other factors that can lead to these results, like physical impairments, ability to reach a clinic, etc. 
+
+### References
+
+Bertakis, K. D., Azari, R., Helms, L. J., Callahan, E. J., & Robbins, J. A. (2000). Gender differences in the utilization of health care services. The Journal of Family Practice, 49(2), 147.
+
+Galdas, P. M., Cheater, F., & Marshall, P. (2005). Men and health help‐seeking behaviour: literature review. Journal of Advanced Nursing, 49(6), 616–623. https://doi.org/10.1111/j.1365-2648.2004.03331.x
+
